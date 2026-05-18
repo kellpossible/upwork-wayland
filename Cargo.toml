@@ -1,0 +1,40 @@
+[package]
+name = "upwork-wayland"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Run Upwork's desktop time tracker on Wayland by routing screenshots through xdg-desktop-portal and idle through ext_idle_notify_v1."
+license = "MIT"
+
+[dependencies]
+# D-Bus. We use the blocking API; zbus's defaults give us the async-io
+# (non-tokio) executor, which is what we want.
+zbus = "5"
+
+# Wayland client + protocols (for ext_idle_notify_v1 only)
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# Event loop for the Wayland thread (multiplexes wl_display fd + channels)
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+
+# Signal handling for graceful shutdown
+signal-hook = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging (facade + console backend)
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1"
+
+# Send SIGTERM to the Upwork child
+rustix = { version = "1", features = ["process"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
