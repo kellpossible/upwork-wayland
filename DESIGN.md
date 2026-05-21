@@ -64,6 +64,7 @@ We want to replace it with a Rust binary that is self-contained, uses native Way
 | F6  | Exits when the Upwork child process exits, propagating its exit code. Cleans up D-Bus name registration and Wayland connection on exit. |
 | F7  | An `install` subcommand writes `~/.local/share/applications/upwork-wayland.desktop` with the `Exec=` line pointing at `upwork-wayland run`. The basename must be `upwork-wayland.desktop` to match the app_id we register with the portal. |
 | F8  | At portal-backend startup, calls `org.freedesktop.host.portal.Registry.Register("upwork-wayland", {})` so the Plasma 6.5+ permission-grant dialog can show our Name/Icon instead of the generic "An app wants to take screenshots". |
+| F9  | If `upwork-wayland` itself dies unexpectedly (SIGKILL, panic, segfault — i.e. paths that don't go through `KillOnDrop`), the kernel sends `SIGTERM` to the Upwork child via `prctl(PR_SET_PDEATHSIG, SIGTERM)`. |
 
 ### 4.2 Non-functional
 
@@ -218,56 +219,69 @@ The single v0.1 implementation is `ExtIdleNotifyBackend`. On startup we create a
 3. `/opt/Upwork/upwork`
 4. `/usr/bin/upwork`
 
-`launcher::spawn(path)` uses `std::process::Command` with:
+`launcher::spawn_and_wait(path)` builds `std::process::Command` with:
 
 ```rust
 .env("XDG_SESSION_TYPE", "x11")
 .env_remove("WAYLAND_DISPLAY")
+.pre_exec(|| rustix::process::set_parent_process_death_signal(Some(Signal::TERM)))
 .spawn()?
 ```
 
-We call `child.wait()` from the main thread and use the resulting exit code as our own. The `std` `Command` doesn't have `kill_on_drop`, so on a panic / signal we explicitly kill the child via a `Drop` guard wrapper (small type owning `Child` that calls `kill()` if dropped without `into_inner()`).
+Two safety nets for child cleanup:
+
+1. **Graceful path** — `KillOnDrop` `Drop` guard wraps the `Child`. On a graceful shutdown we call `into_inner()` to extract the child and skip the kill. On any other drop (panic, error return) the guard sends `SIGKILL` and `wait()`s.
+2. **Hard kernel-side path** — `pre_exec` calls `prctl(PR_SET_PDEATHSIG, SIGTERM)` inside the forked child before `execve`. If the main thread of `upwork-wayland` dies (SIGKILL, segfault, OOM-killer, anything that bypasses Rust's `Drop`), the kernel synchronously delivers `SIGTERM` to the Upwork child. This satisfies F9.
+
+We call `child.wait()` from the main thread and propagate its exit code as our own.
 
 ### 5.6 `install` subcommand
 
-Generates `~/.local/share/applications/upwork.desktop` from a baked-in template, substituting the absolute path of the current `upwork-wayland` binary (via `std::env::current_exe()`). Refuses to overwrite an existing file unless `--force` is passed.
+Generates `~/.local/share/applications/upwork-wayland.desktop` from a baked-in template, substituting the absolute path of the current `upwork-wayland` binary (via `std::env::current_exe()`). The basename `upwork-wayland.desktop` is significant: it must match the `app_id` we register with the portal (F8) so the consent dialog can find our `Name`/`Icon`.
+
+If a `.desktop` file already exists at the target path, we print both the old and new contents and prompt the user to confirm the overwrite. Pass `--force` to skip the prompt (e.g. for scripting).
 
 ## 6. CLI
 
 ```
-upwork-wayland [run] [--upwork-path PATH] [-v|--verbose]
-upwork-wayland install [--force]
+upwork-wayland [run] [--upwork-path PATH]   # launch Upwork + bridge (default)
+upwork-wayland serve                         # bridge only; no Upwork launch (used by the integration test)
+upwork-wayland install [--force]             # write the .desktop file
 upwork-wayland --help
 upwork-wayland --version
 ```
 
 `run` is the default subcommand if none is given.
 
+There is no `-v`/`--verbose` flag; log level is controlled by the `RUST_LOG` environment variable (see [§13](#13-logging)).
+
 ## 7. Project layout
 
 ```
 upwork-wayland/
 ├── Cargo.toml
-├── mise.toml
+├── mise.toml          — pinned toolchain + `build`/`test`/`smoke` tasks
 ├── mise.lock
 ├── DESIGN.md
-├── README.md         (later)
-├── LICENSE           (MIT, matches original)
-└── src/
-    ├── main.rs       — entry, env_logger init, subcommand dispatch
-    ├── cli.rs        — clap definitions
-    ├── bridge/
-    │   ├── mod.rs    — wire-up: spawn Wayland thread, build backends, claim D-Bus names
-    │   ├── dbus.rs   — zbus interface impls for Screenshot & IdleMonitor; fs::rename helper
-    │   ├── wayland.rs— Wayland connection + calloop loop; just the idle subscription
-    │   ├── screenshot/
-    │   │   ├── mod.rs   — ScreenshotBackend trait
-    │   │   └── portal.rs— org.freedesktop.portal.Screenshot client
-    │   └── idle/
-    │       ├── mod.rs— IdleBackend trait
-    │       └── ext.rs— reads last_active updated by the Wayland thread
-    ├── launcher.rs   — find Upwork, spawn with X11 env, signal-hook integration, kill-on-drop guard
-    └── install.rs    — write .desktop file (with diff-style overwrite confirmation)
+├── README.md
+├── LICENSE
+├── src/
+│   ├── main.rs        — entry, log filter setup, subcommand dispatch (run/serve/install)
+│   ├── cli.rs         — clap definitions
+│   ├── bridge/
+│   │   ├── mod.rs     — wire-up: spawn Wayland thread, build backends, claim D-Bus names
+│   │   ├── dbus.rs    — zbus interface impls for Screenshot & IdleMonitor; fs::rename helper
+│   │   ├── wayland.rs — Wayland connection + calloop loop; just the idle subscription
+│   │   ├── screenshot/
+│   │   │   ├── mod.rs    — ScreenshotBackend trait
+│   │   │   └── portal.rs — org.freedesktop.portal.Screenshot client + Registry.Register
+│   │   └── idle/
+│   │       ├── mod.rs — IdleBackend trait
+│   │       └── ext.rs — reads last_active updated by the Wayland thread
+│   ├── launcher.rs    — find Upwork, spawn with X11 env, signal-hook, PDEATHSIG, KillOnDrop
+│   └── install.rs     — write .desktop file (with diff-style overwrite confirmation)
+└── tests/
+    └── screenshot.rs  — #[ignore]'d integration test (spawns `serve`, calls Screenshot via gdbus, validates PNG)
 ```
 
 ## 8. Dependencies
@@ -326,11 +340,11 @@ Targets and components beyond `rustc`+`cargo` aren't needed at this stage (no cr
 
 ## 10. Testing strategy
 
-Personal-tool scope; we keep this light:
+Personal-tool scope; we keep this light.
 
-- **Unit tests** for `launcher::find_upwork` (mocked filesystem), `install` template substitution, `portal::percent_decode` and `portal::uri_to_path`.
-- **Manual smoke test** documented in README: `cargo run -- run`, then call `gdbus call --session --dest org.gnome.Shell.Screenshot --object-path /org/gnome/Shell/Screenshot --method org.gnome.Shell.Screenshot.Screenshot true false /tmp/test.png` from another terminal; verify the PNG.
-- **No integration tests** against a live compositor in CI (no CI). Correctness verified by hand on KDE Plasma 6.6.4.
+- **Integration test** at `tests/screenshot.rs` (run via `mise run smoke`, or `cargo test -- --ignored`). Spawns `upwork-wayland serve`, calls `org.gnome.Shell.Screenshot.Screenshot` via `gdbus`, asserts that the resulting file exists and starts with the PNG magic bytes. Marked `#[ignore]` so it stays out of the normal `cargo test` run — it needs a real Wayland session, an `xdg-desktop-portal` implementation, and (on Plasma 6.5+) an already-granted "Allow" for `upwork-wayland`.
+- **No unit tests yet.** Candidates worth writing if churn warrants: `launcher::find_upwork` (filesystem-mocked), `install` template substitution, `portal::percent_decode` and `portal::uri_to_path`. Skipped for now — these functions are small enough that the integration test catches any regression that matters.
+- **No CI.** Correctness verified by hand on KDE Plasma 6.6.4.
 
 ## 11. Open questions / deferred decisions
 
@@ -349,6 +363,20 @@ Personal-tool scope; we keep this light:
 | `org.freedesktop.host.portal.Registry` is unavailable (xdg-desktop-portal < 1.18). | `Register()` fails non-fatally; we log a warning and proceed without app identification (consent dialog stays generic). |
 | User hasn't run `upwork-wayland install`, so no `.desktop` file matches our `app_id`. | Permission dialog stays generic. README/`install` help text directs the user to install before running. |
 | The `wayland-protocols` staging module reorganizes `ext_idle_notify_v1`. | Pin to a specific minor version; bump deliberately. |
+
+## 13. Logging
+
+We use the `log` facade with `env_logger` reading `RUST_LOG` at startup, with two project-specific tweaks in `main::init_logging`:
+
+1. **Default filter is `info`** if `RUST_LOG` is unset.
+2. **`zbus` and `tracing` are clamped to `warn`** regardless of the user's filter — unless the user explicitly names them (e.g. `RUST_LOG=info,zbus=debug` opts back in for that module). Without this, even our default `info` level is dominated by zbus connection-handshake and dispatch noise.
+
+What's at each level in our own modules:
+
+- `info` — startup/shutdown milestones, successful screenshot result ("`Screenshot → /tmp/foo.png`"), Upwork pid, idle subscription parameters.
+- `debug` — every D-Bus method call's args, every `idled`/`resumed` event, the portal `Register` outcome.
+- `warn` — recoverable degradations (Registry portal unavailable, KillOnDrop firing).
+- `error` — capture or file-placement failures that we report back to D-Bus as `(false, "")`.
 
 ---
 

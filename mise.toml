@@ -1,2 +1,14 @@
 [tools]
 rust = "1.95.0"
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run unit + integration tests (skips #[ignore]-marked smoke test)"
+run = "cargo test"
+
+[tasks.smoke]
+description = "Run the live-session smoke test (needs Wayland + portal consent already granted)"
+run = "cargo test -- --ignored"

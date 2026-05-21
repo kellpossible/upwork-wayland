@@ -11,8 +11,23 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     match cli.command.unwrap_or_default() {
         cli::Command::Run(args) => run(args),
+        cli::Command::Serve => serve(),
         cli::Command::Install(args) => install::run(args),
     }
+}
+
+fn serve() -> Result<()> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let bridge = bridge::start()?;
+    log::info!("bridge running; send SIGINT/SIGTERM to stop");
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    if let Some(sig) = signals.forever().next() {
+        log::info!("received signal {sig}, shutting down");
+    }
+    bridge.shutdown();
+    Ok(())
 }
 
 /// Configure `env_logger` from `RUST_LOG` (defaulting to `info` if unset),

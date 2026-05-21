@@ -13,6 +13,9 @@ pub struct Cli {
 pub enum Command {
     /// Launch Upwork with the D-Bus bridge running in the same process (default).
     Run(RunArgs),
+    /// Run only the D-Bus bridge, without launching Upwork. Intended for tests
+    /// and ad-hoc debugging. Exits on SIGINT/SIGTERM.
+    Serve,
     /// Install a .desktop entry pointing at this binary.
     Install(InstallArgs),
 }
