@@ -6,7 +6,7 @@ Upwork refuses to launch on a pure-Wayland desktop ("Upwork screenshots are only
 
 Tested on **KDE Plasma 6.6 (Wayland)** on Fedora 44. Should also work on GNOME and wlroots-based compositors with an xdg-desktop-portal backend installed, though that path is untested.
 
-**WARNING:** This app was mostly vibe-coded, but reviewed and tested by a human, use at your own peril!
+**WARNING:** This app was mostly vibe-coded, tested but not extensively reviewed by a human, use at your own peril!
 
 ## What it does
 
