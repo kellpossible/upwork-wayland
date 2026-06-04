@@ -13,10 +13,10 @@ Tested on **KDE Plasma 6.6 (Wayland)** on Fedora 44. Should also work on GNOME a
 - Claims `org.gnome.Shell.Screenshot` and `org.gnome.Mutter.IdleMonitor` on the session bus, implementing exactly the methods Upwork calls.
 - Routes `Screenshot` calls into `org.freedesktop.portal.Screenshot` (xdg-desktop-portal).
 - Tracks idle time via the native Wayland `ext_idle_notify_v1` protocol.
-- Launches Upwork as a child process with `XDG_SESSION_TYPE=x11` (and `WAYLAND_DISPLAY` unset) so it stops complaining about the session type.
+- Launches Upwork as a child process with `XDG_SESSION_TYPE=x11` and `WAYLAND_DISPLAY=""`, and `LD_PRELOAD`s a small capture shim, so that *every* periodic screenshot — not just the first — is captured through the portal rather than coming back black. See [DESIGN.md](./DESIGN.md#periodic-screenshots-the-iswayland-trap) for why both pieces are required.
 - Exits when Upwork exits; if it's killed unexpectedly, the Linux kernel terminates Upwork too (`PR_SET_PDEATHSIG`).
 
-There is no daemon, no system service, no shell script. One binary, one process.
+There is no daemon, no system service, no shell script. One binary, one process (plus a tiny preload shim it writes to a temp dir and cleans up on exit).
 
 ## Requirements
 
@@ -24,6 +24,7 @@ There is no daemon, no system service, no shell script. One binary, one process.
 - `xdg-desktop-portal` 1.18+ (for the `org.freedesktop.host.portal.Registry` interface, so KDE's permission dialog shows our app name).
 - On KDE: **Plasma 6.5+** for persistent per-app screenshot permissions. Earlier versions prompt for consent on every call, which doesn't fit Upwork's polling pattern.
 - The Upwork Linux client installed at `/opt/Upwork/upwork` or `/usr/bin/upwork`.
+- `gdbus` on `PATH` (ships with GLib / `glib2`; present on any desktop with a session bus). The capture shim shells out to it. _Temporary — to be replaced with an in-process GLib/GIO call; see [DESIGN.md](./DESIGN.md#periodic-screenshots-the-iswayland-trap)._
 - Rust 1.95 (handled automatically via [mise](https://mise.jdx.dev/)).
 
 ## Build

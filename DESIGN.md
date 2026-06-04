@@ -223,7 +223,8 @@ The single v0.1 implementation is `ExtIdleNotifyBackend`. On startup we create a
 
 ```rust
 .env("XDG_SESSION_TYPE", "x11")
-.env_remove("WAYLAND_DISPLAY")
+.env("WAYLAND_DISPLAY", "")           // empty, NOT unset — see §5.5.1
+.env("LD_PRELOAD", capture_shim_so)   // see §5.5.1
 .pre_exec(|| rustix::process::set_parent_process_death_signal(Some(Signal::TERM)))
 .spawn()?
 ```
@@ -234,6 +235,26 @@ Two safety nets for child cleanup:
 2. **Hard kernel-side path** — `pre_exec` calls `prctl(PR_SET_PDEATHSIG, SIGTERM)` inside the forked child before `execve`. If the main thread of `upwork-wayland` dies (SIGKILL, segfault, OOM-killer, anything that bypasses Rust's `Drop`), the kernel synchronously delivers `SIGTERM` to the Upwork child. This satisfies F9.
 
 We call `child.wait()` from the main thread and propagate its exit code as our own.
+
+### 5.5.1 Periodic screenshots: the `isWayland` trap
+
+Claiming `org.gnome.Shell.Screenshot` is necessary but **not sufficient**. With only that, the *first* screenshot of a session lands and every subsequent (periodic) one fails — the preview shows "Wayland is not supported". Two independent prior projects (see README "Similar projects") hit the identical wall; it surfaced in Upwork builds around late 2025.
+
+Root cause, found by disassembling `uta_native.node`:
+
+- Upwork detects Wayland natively in `DesktopSessionData::define_session_type`: it `dlopen`s `libwayland-client.so.0` and calls `wl_display_connect(NULL)`. Success → caches `isWayland = true`.
+- The result drives **two** consumers that want **opposite** values:
+  - **JS guard** (`if (utaNative.isWayland()) return <empty-screenshot>`) runs before each *periodic* capture. Wants `isWayland = false` or it blocks the capture.
+  - **Native capture** (`DesktopSessionAgent::SnapWholeDesktop` / `SnapActiveDisplay`) branches on the same byte: `true` → capture via the D-Bus screenshot interface (our bridge); `false` → capture in-process via `gdk_pixbuf_get_from_window` on the X11 root window, which is **black under XWayland**.
+
+Both read the same byte, so no single value — and therefore no environment variable — makes periodic captures work: `true` → JS blocks; `false` → native goes black. (The first screenshot escapes because it runs through a different, ungated code path.)
+
+The fix is two coupled pieces, both applied to the Upwork child only:
+
+1. **`WAYLAND_DISPLAY=""`** (empty, not unset). This forces `isWayland = false`, so the JS guard stops blocking periodic captures. Empty threads the needle between the two layers: the JS check is `!!process.env.WAYLAND_DISPLAY`, which is falsy for `""`; meanwhile `wl_display_connect` with an empty socket name fails to connect (verified against the real libwayland), whereas *unset* makes libwayland fall back to the default name `wayland-0` and connect. Any *non-empty* value also fails the native connect but is truthy in JS, so it must be exactly empty.
+2. **`LD_PRELOAD` a capture shim** (`shim/gdk_shim.rs`, compiled to a cdylib by `build.rs`, embedded via `include_bytes!`, written to a temp dir at launch). With `isWayland = false` the native code calls `gdk_pixbuf_get_from_window` — a normal dynamically-linked symbol, so `LD_PRELOAD` interposes it (unlike `wl_display_connect`, which Upwork reaches via `dlopen`/`dlsym` and preload cannot touch). The shim ignores the black root window and instead asks our own bridge for a real frame (`org.gnome.Shell.Screenshot.Screenshot` → xdg-desktop-portal), loads the returned PNG with the real `gdk_pixbuf_new_from_file` (resolved via `RTLD_NEXT`), and returns that pixbuf. Both `SnapWholeDesktop` and `SnapActiveDisplay` use this symbol, so full-desktop and active-display captures are both covered.
+
+**Known shortcut:** the shim currently shells out to `gdbus` for the capture, which adds a runtime dependency on that binary (ships with GLib). The intended replacement is an in-process call via the GLib/GIO symbols already loaded in Upwork's address space (`g_bus_get_sync` / `g_dbus_connection_call_sync`, resolved with `dlsym`), which removes the external-binary dependency and restores Goal 2.
 
 ### 5.6 `install` subcommand
 
@@ -278,8 +299,11 @@ upwork-wayland/
 │   │   └── idle/
 │   │       ├── mod.rs — IdleBackend trait
 │   │       └── ext.rs — reads last_active updated by the Wayland thread
-│   ├── launcher.rs    — find Upwork, spawn with X11 env, signal-hook, PDEATHSIG, KillOnDrop
+│   ├── launcher.rs    — find Upwork, spawn with X11 env + WAYLAND_DISPLAY="" + LD_PRELOAD, signal-hook, PDEATHSIG, KillOnDrop
 │   └── install.rs     — write .desktop file (with diff-style overwrite confirmation)
+├── shim/
+│   └── gdk_shim.rs    — LD_PRELOAD cdylib: interposes gdk_pixbuf_get_from_window, captures via the bridge (see §5.5.1)
+├── build.rs           — compiles shim/gdk_shim.rs to a cdylib and exposes its path as UPWORK_GDK_SHIM
 └── tests/
     └── screenshot.rs  — #[ignore]'d integration test (spawns `serve`, calls Screenshot via gdbus, validates PNG)
 ```
